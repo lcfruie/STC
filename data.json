@@ -1,0 +1,7 @@
+{
+    "train_metadata_path": "train_metadata.csv",
+    "train_data_folder_path": "train_data",
+    "val_metadata_path": "val_metadata.csv",
+    "val_data_folder_path": "val_data",
+    "csv_size": 20000
+}

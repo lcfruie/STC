@@ -1,0 +1,6 @@
+/stc/
+.venv/
+venv/
+wavtokenizer.ckpt
+wavtokenizer.yaml
+__pycache__/

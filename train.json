@@ -1,0 +1,12 @@
+{
+    "model_folder_path": "stc",
+    "dim_embed": 1024,
+    "nheads": 16,
+    "nlayers": 12,
+    "dim_feedforward": 4096,
+    "text_max_len": 200,
+    "audio_max_len": 1000,
+    "initial_lr": 1e-4,
+    "nepochs": 30,
+    "batch_size": 2
+}

@@ -1,0 +1,4 @@
+{
+    "config_path": "wavtokenizer.yaml",
+    "model_path": "wavtokenizer.ckpt"
+}

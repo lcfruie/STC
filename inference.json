@@ -1,0 +1,6 @@
+{
+    "model_folder_path": "stc",
+    "audio_prompt_path": "prompt.wav",
+    "audio_output_path": "target.wav",
+    "text_input": "this is a test"
+}
