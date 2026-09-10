@@ -1,10 +1,14 @@
-from decoder.pretrained import WavTokenizer
-import torch
+"""Thin wrappers around the WavTokenizer encoder/decoder."""
+
 import json
 
+import torch
+from decoder.pretrained import WavTokenizer
 
-def get_wavtokenizer_model() -> WavTokenizer:
-    with open(f"wavtokenizer.json", "r") as f:
+
+def load_wavtokenizer() -> WavTokenizer:
+    """Load WavTokenizer from paths listed in wavtokenizer.json."""
+    with open("wavtokenizer.json", "r") as f:
         config = json.load(f)
     return WavTokenizer.from_pretrained0802(
         config["config_path"],
@@ -12,35 +16,37 @@ def get_wavtokenizer_model() -> WavTokenizer:
     )
 
 
-def get_wavtokenizer_encoded(
-    x: torch.Tensor,
+def encode_waveform(
+    waveform: torch.Tensor,
     model: WavTokenizer,
 ) -> torch.Tensor:
+    """Encode a waveform into discrete audio codes."""
     bandwidth_id = torch.tensor(
         [0],
         dtype=torch.long,
-        device=x.device,
+        device=waveform.device,
     )
     with torch.no_grad():
-        x = model.encode(
-            x,
+        codes = model.encode(
+            waveform,
             bandwidth_id=bandwidth_id,
         )[-1]
-    return x
+    return codes
 
 
-def get_wavtokenizer_decoded(
-    x: torch.Tensor,
+def decode_codes(
+    codes: torch.Tensor,
     model: WavTokenizer,
 ) -> torch.Tensor:
+    """Decode discrete audio codes back into a waveform."""
     bandwidth_id = torch.tensor(
         [0],
         dtype=torch.long,
-        device=x.device,
+        device=codes.device,
     )
     with torch.no_grad():
-        x = model.decode(
-            model.codes_to_features(x),
+        waveform = model.decode(
+            model.codes_to_features(codes),
             bandwidth_id=bandwidth_id,
         )
-    return x
+    return waveform

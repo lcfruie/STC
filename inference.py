@@ -1,55 +1,65 @@
-from modules import (
-    TextTokenizer,
-    AudioTokenizer,
-    Model,
-)
-from wavtokenizer import (
-    get_wavtokenizer_model,
-    get_wavtokenizer_encoded,
-    get_wavtokenizer_decoded,
-)
-from device import get_device
-from utils import load_audio
-import torchaudio
-import pickle
-import torch
+"""
+Inference entrypoint for ASR (audio prompt -> text) and optional TTS.
+
+Loads a trained checkpoint from model_folder_path (see inference.json),
+transcribes the audio prompt, then — if text_input and audio_output_path
+are set — continues generation with TTS and writes a waveform.
+"""
+
 import json
+import pickle
+
+import torch
+import torchaudio
+from device import get_device
+from modules import AUDIO_CODEBOOK_SIZE, AudioTokenizer, Model, TextTokenizer
+from utils import SAMPLE_RATE, load_audio
+from wavtokenizer import decode_codes, encode_waveform, load_wavtokenizer
 
 
-def get_filtered(
+def filter_logits(
     logits: torch.Tensor,
     top_k: int = 200,
     top_p: float = 0.90,
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    logits = logits.clone() / temperature
+    """Apply temperature, top-k, and nucleus (top-p) filtering to logits."""
+    filtered = logits.clone() / temperature
+    filter_value = -float("Inf")
+
     if top_k > 0:
-        kth_values = torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
-        logits[logits < kth_values] = -float("Inf")
+        top_k_threshold = torch.topk(filtered, top_k, dim=-1)[0][..., -1, None]
+        filtered[filtered < top_k_threshold] = filter_value
 
     if top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
         sorted_probs = torch.softmax(
-            sorted_logits - sorted_logits.max(dim=-1, keepdim=True)[0], dim=-1
+            sorted_logits - sorted_logits.max(dim=-1, keepdim=True)[0],
+            dim=-1,
         )
-        sorted_indices_to_remove = sorted_probs.cumsum(dim=-1) > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = False
-        indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
-        indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
-        logits[indices_to_remove] = -float("Inf")
-    return logits
+        cumulative_probs = sorted_probs.cumsum(dim=-1)
+
+        remove_sorted = cumulative_probs > top_p
+        remove_sorted[..., 1:] = remove_sorted[..., :-1].clone()
+        remove_sorted[..., 0] = False
+
+        remove_mask = torch.zeros_like(filtered, dtype=torch.bool)
+        remove_mask.scatter_(1, sorted_indices, remove_sorted)
+        filtered[remove_mask] = filter_value
+
+    return filtered
 
 
 if __name__ == "__main__":
     with open("inference.json", "r") as f:
-        config = json.load(f)
+        inference_config = json.load(f)
 
-    model_folder_path = config["model_folder_path"]
-    audio_prompt_path = config["audio_prompt_path"]
-    audio_output_path = config["audio_output_path"]
-    text_input = config["text_input"]
+    model_folder_path = inference_config["model_folder_path"]
+    audio_prompt_path = inference_config["audio_prompt_path"]
+    audio_output_path = inference_config["audio_output_path"]
+    text_input = inference_config["text_input"]
 
+    # --- Load tokenizers, config, and checkpoint ---
     with open(f"{model_folder_path}/text_tokenizer.pkl", "rb") as f:
         text_tokenizer: TextTokenizer = pickle.load(f)
 
@@ -57,24 +67,24 @@ if __name__ == "__main__":
         audio_tokenizer: AudioTokenizer = pickle.load(f)
 
     with open(f"{model_folder_path}/config.json", "r") as f:
-        config = json.load(f)
+        model_config = json.load(f)
 
-    text_vocab_size = config["text_vocab_size"]
-    audio_vocab_size = config["audio_vocab_size"]
-    dim_embed = config["dim_embed"]
-    nheads = config["nheads"]
-    nlayers = config["nlayers"]
-    dim_feedforward = config["dim_feedforward"]
-    text_max_len = config["text_max_len"]
-    audio_max_len = config["audio_max_len"]
+    text_vocab_size = model_config["text_vocab_size"]
+    audio_vocab_size = model_config["audio_vocab_size"]
+    embed_dim = model_config["embed_dim"]
+    num_heads = model_config["num_heads"]
+    num_layers = model_config["num_layers"]
+    feedforward_dim = model_config["feedforward_dim"]
+    text_max_len = model_config["text_max_len"]
+    audio_max_len = model_config["audio_max_len"]
 
     model = Model(
         text_vocab_size,
         audio_vocab_size,
-        dim_embed,
-        nheads,
-        nlayers,
-        dim_feedforward,
+        embed_dim,
+        num_heads,
+        num_layers,
+        feedforward_dim,
         text_max_len,
         audio_max_len,
     )
@@ -85,88 +95,91 @@ if __name__ == "__main__":
     model.to(device)
     model.eval()
 
-    wavtokenizer = get_wavtokenizer_model()
+    wavtokenizer = load_wavtokenizer()
     wavtokenizer.to(device)
     wavtokenizer.eval()
 
-    audio = get_wavtokenizer_encoded(
+    prompt_codes = encode_waveform(
         load_audio(audio_prompt_path).to(device),
         wavtokenizer,
     )
-    audio = audio.detach().cpu().flatten()
+    prompt_codes = prompt_codes.detach().cpu().flatten()
 
-    text = text_tokenizer.encode()
-    text = text.unsqueeze(0).to(device)
-    audio = audio_tokenizer.encode(audio)
-    audio = audio.unsqueeze(0).to(device)
+    text_tokens = text_tokenizer.encode().unsqueeze(0).to(device)
+    audio_tokens = audio_tokenizer.encode(prompt_codes).unsqueeze(0).to(device)
 
+    # --- ASR: autoregressive text generation conditioned on the prompt ---
     with torch.no_grad():
         cache = None
-        while text.size(1) < text_max_len:
-            if cache == None:
-                text_last, cache = model.asr(
-                    text,
-                    audio,
+        next_text_token = text_tokens
+        while text_tokens.size(1) < text_max_len:
+            if cache is None:
+                next_text_logits, cache = model.asr(
+                    next_text_token,
+                    audio_tokens,
                     cache,
                 )
             else:
-                text_last, cache = model.asr(
-                    text_last,
-                    None,
-                    cache,
-                )
-            text_last = torch.argmax(text_last[:, -1], dim=-1).unsqueeze(1)
-            if text_last.item() == text_tokenizer.eos_tok:
+                next_text_logits, cache = model.asr(next_text_token, None, cache)
+
+            next_text_token = torch.argmax(
+                next_text_logits[:, -1],
+                dim=-1,
+            ).unsqueeze(1)
+
+            if next_text_token.item() == text_tokenizer.eos_tok:
                 break
-            text = torch.concat([text, text_last], dim=-1)
+            text_tokens = torch.concat([text_tokens, next_text_token], dim=-1)
 
-    text = text.squeeze(0)
-    text = text_tokenizer.decode(text)
+    transcribed_text = text_tokenizer.decode(text_tokens.squeeze(0))
+    print(f"Text: {transcribed_text}")
 
-    print(f"Text: {text}")
-
+    # --- Optional TTS: continue from ASR text + text_input ---
     if audio_output_path and text_input:
-        text = text + "," + text_input
-        text = text_tokenizer.encode(text)
-        text = text.unsqueeze(0).to(device)
+        tts_text = transcribed_text + "," + text_input
+        text_tokens = text_tokenizer.encode(tts_text).unsqueeze(0).to(device)
 
-        audio = audio[:, :-1]
-        audio_len = audio.size(1)
+        # Drop eos from the prompt so generation can continue.
+        audio_tokens = audio_tokens[:, :-1]
+        prompt_token_len = audio_tokens.size(1)
 
         with torch.no_grad():
             cache = None
-            while audio.size(1) < audio_max_len:
-                if cache == None:
-                    audio_last, cache = model.tts(
-                        audio,
-                        text,
+            next_audio_token = audio_tokens
+            while audio_tokens.size(1) < audio_max_len:
+                if cache is None:
+                    next_audio_logits, cache = model.tts(
+                        next_audio_token,
+                        text_tokens,
                         cache,
                     )
                 else:
-                    audio_last, cache = model.tts(
-                        audio_last,
+                    next_audio_logits, cache = model.tts(
+                        next_audio_token,
                         None,
                         cache,
                     )
-                audio_last = torch.multinomial(
+
+                next_audio_token = torch.multinomial(
                     torch.softmax(
-                        get_filtered(audio_last[:, -1]),
+                        filter_logits(next_audio_logits[:, -1]),
                         dim=-1,
                     ),
                     num_samples=1,
                 )
-                if audio_last.item() == audio_tokenizer.eos_tok:
+
+                if next_audio_token.item() == audio_tokenizer.eos_tok:
                     break
-                audio = torch.concat([audio, audio_last], dim=-1)
+                audio_tokens = torch.concat([audio_tokens, next_audio_token], dim=-1)
 
-        audio = audio[:, audio_len:]
-        audio = audio * (audio < 4096)
+        generated_codes = audio_tokens[:, prompt_token_len:]
+        # Keep only codebook ids; zero out special tokens.
+        generated_codes = generated_codes * (generated_codes < AUDIO_CODEBOOK_SIZE)
 
-        audio = get_wavtokenizer_decoded(
-            audio,
-            wavtokenizer,
+        waveform = decode_codes(generated_codes, wavtokenizer)
+        torchaudio.save(
+            audio_output_path,
+            waveform.detach().cpu(),
+            SAMPLE_RATE,
         )
-
-        audio = audio.detach().cpu()
-        torchaudio.save(audio_output_path, audio, 24000)
         print("Audio Generated.")

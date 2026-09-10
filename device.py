@@ -1,10 +1,12 @@
+"""Device selection helper (CUDA > MPS > CPU)."""
+
 import torch
 
 
 def get_device() -> torch.device:
-    device_type = "cpu"
+    """Return the best available torch device."""
     if torch.cuda.is_available():
-        device_type = "cuda"
-    elif torch.backends.mps.is_available():
-        device_type = "mps"
-    return torch.device(device_type)
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")

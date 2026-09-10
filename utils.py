@@ -1,19 +1,32 @@
-import torchaudio
+"""Shared helpers: audio loading and the fixed text vocabulary."""
+
+from typing import Dict
+
 import torch
+import torchaudio
+
+SAMPLE_RATE = 24000
 
 
 def load_audio(path: str) -> torch.Tensor:
-    wav, sr = torchaudio.load(path)
-    if not sr == 24000:
-        wav = torchaudio.functional.resample(
-            wav,
-            sr,
-            24000,
+    """Load a waveform and resample to SAMPLE_RATE if needed."""
+    waveform, sample_rate = torchaudio.load(path)
+    if sample_rate != SAMPLE_RATE:
+        waveform = torchaudio.functional.resample(
+            waveform,
+            sample_rate,
+            SAMPLE_RATE,
         )
-    return wav
+    return waveform
 
 
-def get_vocab() -> dict:
+def get_text_vocab() -> Dict[str, int]:
+    """
+    Fixed character vocabulary used by TextTokenizer.
+
+    Characters are English-only (a–z, space, and a few punctuation marks),
+    plus special tokens. Extend or replace this dict for other languages.
+    """
     return {
         "a": 0,
         "b": 1,

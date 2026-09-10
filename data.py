@@ -1,90 +1,117 @@
-from wavtokenizer import get_wavtokenizer_model, get_wavtokenizer_encoded
-from device import get_device
-from utils import load_audio
-import pandas as pd
+"""
+Build training/validation shards from metadata CSVs.
+
+Reads paths and shard size from data.json, encodes each audio file with
+WavTokenizer, and writes chunked CSV files under the configured data folders.
+Each output CSV has columns: text, audio (list of discrete token ids).
+"""
+
 import json
 import os
 
+import pandas as pd
+import torch
+from decoder.pretrained import WavTokenizer
+from device import get_device
+from utils import load_audio
+from wavtokenizer import encode_waveform, load_wavtokenizer
 
-def save_csv(
-    data: list,
-    data_folder_path: str,
-    filename_id: int,
+
+def save_shard(
+    rows: list,
+    output_dir: str,
+    shard_id: int,
 ) -> None:
-    pd.DataFrame(data, columns=["text", "audio"]).to_csv(
-        f"{data_folder_path}/{filename_id}.csv", index=False
+    """Write one shard of (text, audio-token) pairs as a CSV."""
+    pd.DataFrame(rows, columns=["text", "audio"]).to_csv(
+        f"{output_dir}/{shard_id}.csv",
+        index=False,
     )
 
 
-def create_data(
+def create_sharded_dataset(
     metadata_path: str,
-    data_folder_path: str,
+    output_dir: str,
+    shard_size: int,
+    device: torch.device,
+    wavtokenizer: WavTokenizer,
 ) -> None:
-    data = []
-    df = pd.read_csv(metadata_path)
-    df_len = len(df)
-    os.makedirs(data_folder_path, exist_ok=True)
-    filename_id = len(os.listdir(data_folder_path))
-    df = df.iloc[filename_id * csv_size :]
-    for _, row in df.iterrows():
-        data.append(
-            [
-                row.iloc[0],
-                get_wavtokenizer_encoded(
-                    load_audio(row.iloc[1]).to(device),
-                    wavtokenizer,
-                )
-                .flatten()
-                .tolist(),
-            ]
-        )
-        print(
-            f"\rProcessing: {filename_id * csv_size + len(data)}/{df_len}",
-            end="",
-            flush=True,
-        )
-        if len(data) == csv_size:
-            save_csv(
-                data,
-                data_folder_path,
-                filename_id,
+    """
+    Encode metadata rows into sharded CSVs under output_dir.
+
+    Resumes from the number of existing shard files so interrupted runs can
+    continue.
+    """
+    metadata = pd.read_csv(metadata_path)
+    total_rows = len(metadata)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Skip rows already covered by existing shard files.
+    shard_id = len(os.listdir(output_dir))
+    metadata = metadata.iloc[shard_id * shard_size :]
+
+    shard_rows = []
+    for _, row in metadata.iterrows():
+        text = row.iloc[0]
+        audio_path = row.iloc[1]
+        audio_codes = (
+            encode_waveform(
+                load_audio(audio_path).to(device),
+                wavtokenizer,
             )
-            filename_id += 1
-            data = []
-    if len(data):
-        save_csv(
-            data,
-            data_folder_path,
-            filename_id,
+            .flatten()
+            .tolist()
         )
-    if len(df):
+        shard_rows.append([text, audio_codes])
+
+        processed = shard_id * shard_size + len(shard_rows)
+        print(f"\rProcessing: {processed}/{total_rows}", end="", flush=True)
+
+        if len(shard_rows) == shard_size:
+            save_shard(shard_rows, output_dir, shard_id)
+            shard_id += 1
+            shard_rows = []
+
+    if shard_rows:
+        save_shard(shard_rows, output_dir, shard_id)
+
+    if len(metadata) > 0:
         print("\nDone.")
     else:
         print("Already Done.")
 
 
 if __name__ == "__main__":
-    with open(f"data.json", "r") as f:
+    with open("data.json", "r") as f:
         config = json.load(f)
 
     train_metadata_path = config["train_metadata_path"]
     train_data_folder_path = config["train_data_folder_path"]
-
     val_metadata_path = config["val_metadata_path"]
     val_data_folder_path = config["val_data_folder_path"]
-
-    csv_size = config["csv_size"]
+    shard_size = config["shard_size"]
 
     device = get_device()
-
-    wavtokenizer = get_wavtokenizer_model()
+    wavtokenizer = load_wavtokenizer()
     wavtokenizer.to(device)
     wavtokenizer.eval()
 
     print("Creating Training Data...")
-    create_data(train_metadata_path, train_data_folder_path)
+    create_sharded_dataset(
+        train_metadata_path,
+        train_data_folder_path,
+        shard_size,
+        device,
+        wavtokenizer,
+    )
 
     print()
 
     print("Creating Validation Data...")
-    create_data(val_metadata_path, val_data_folder_path)
+    create_sharded_dataset(
+        val_metadata_path,
+        val_data_folder_path,
+        shard_size,
+        device,
+        wavtokenizer,
+    )
